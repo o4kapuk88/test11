@@ -1,0 +1,85 @@
+import asyncio
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+import pandas as pd
+from asyncio import Semaphore
+import aiofiles
+
+
+async def extract_product_data(page, url, retries=3):
+    for attempt in range(retries):
+        try:
+            await page.goto(url, timeout=60000)
+            await page.wait_for_timeout(3000)
+
+            sku = await page.text_content(
+                'div.props div.prop_container:has(div.prop_name:has-text("Артикул")) div.prop_value')
+            name = await page.text_content(
+                'div.props div.prop_container:has(div.prop_name:has-text("Изготовитель")) div.prop_value')
+
+            analogs = []
+            products = await page.query_selector_all('div.short-product-single__box div.product__characteristic')
+            for product in products:
+                analog_sku = await product.query_selector('span:has-text("Артикул") + span')
+                analog_name = await product.query_selector('span:has-text("Производитель") + span')
+                if analog_sku and analog_name:
+                    analog_sku_text = await analog_sku.text_content()
+                    analog_name_text = await analog_name.text_content()
+                    analogs.append((analog_sku_text.strip(), analog_name_text.strip()))
+            return sku.strip() if sku else None, name.strip() if name else None, analogs
+        except PlaywrightTimeoutError as e:
+            print(f"Timeout при обработке {url}, попытка {attempt + 1} из {retries}: {e}")
+        except Exception as e:
+            print(f"Ошибка при обработке {url}, попытка {attempt + 1} из {retries}: {e}")
+
+    print(f"Не удалось обработать {url} после {retries} попыток")
+    return None, None, []
+
+
+async def process_url(url, browser, semaphore, queue):
+    async with semaphore:
+        page = await browser.new_page()
+        try:
+            sku, name, analogs = await extract_product_data(page, url)
+            if sku and name and analogs:
+                for analog_sku, analog_name in analogs:
+                    await queue.put([name, sku, analog_name, analog_sku])
+        finally:
+            await page.close()
+
+
+async def writer(queue):
+    async with aiofiles.open('output.csv', mode='w', encoding='utf-8') as file:
+        await file.write('Изготовитель,Артикул,Аналог Изготовитель,Аналог Артикул\n')
+        while True:
+            data = await queue.get()
+            if data is None:
+                break
+            await file.write(','.join(data) + '\n')
+            queue.task_done()
+
+
+async def main():
+    with open('product_links.txt', 'r', encoding='utf-8') as file:
+        urls = [url.strip() for url in file.readlines()]
+
+    queue = asyncio.Queue()
+    async with async_playwright() as p:
+        browser = await p.firefox.launch(headless=True)
+        semaphore = Semaphore(10)
+
+        writer_task = asyncio.create_task(writer(queue))
+
+        tasks = [process_url(url, browser, semaphore, queue) for url in urls]
+        await asyncio.gather(*tasks)
+
+        await queue.put(None)
+        await writer_task
+
+        await browser.close()
+
+    df = pd.read_csv('output.csv')
+    df.to_excel('output.xlsx', index=False)
+    print("Данные успешно сохранены в output.xlsx")
+
+
+asyncio.run(main())
